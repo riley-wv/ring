@@ -1,5 +1,5 @@
 {
-  "name": "homebridge-ring",
+  "name": "homebridge-ring-custom",
   "displayName": "Ring",
   "version": "14.3.0",
   "description": "Homebridge plugin for Ring doorbells, cameras, security alarm system and smart lighting",
@@ -29,22 +29,22 @@
   },
   "repository": {
     "type": "git",
-    "url": "git://github.com/dgreif/ring.git"
+    "url": "git://github.com/riley-wv/ring.git"
   },
   "bugs": {
-    "url": "https://github.com/dgreif/ring/issues"
+    "url": "https://github.com/riley-wv/ring/issues"
   },
-  "homepage": "https://github.com/dgreif/ring/tree/main/packages/homebridge-ring#homebridge-ring",
-  "author": "dgreif",
+  "homepage": "https://github.com/riley-wv/ring/tree/main/packages/homebridge-ring#homebridge-ring",
+  "author": "riley-wv",
   "license": "MIT",
   "funding": [
     {
       "type": "paypal",
-      "url": "https://www.paypal.me/dustingreif"
+      "url": "https://www.paypal.me/rileyywebb"
     },
     {
       "type": "github",
-      "url": "https://github.com/sponsors/dgreif"
+      "url": "https://github.com/sponsors/riley-wv"
     }
   ],
   "files": [

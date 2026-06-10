@@ -7,9 +7,14 @@ import {
   RtpSplitter,
 } from '@homebridge/camera-utils'
 import type {
+  CameraController,
+  CameraRecordingConfiguration,
+  CameraRecordingDelegate,
+  CameraRecordingOptions,
   CameraStreamingDelegate,
   PrepareStreamCallback,
   PrepareStreamRequest,
+  RecordingPacket,
   SnapshotRequest,
   SnapshotRequestCallback,
   StartStreamRequest,
@@ -38,6 +43,245 @@ import {
 } from 'werift'
 import type { StreamingSession } from 'ring-client-api/streaming/streaming-session'
 import path from 'node:path'
+import type { RingPlatformConfig } from './config.ts'
+
+type QueuedRecordingPacket =
+  | { packet: RecordingPacket }
+  | { error: Error }
+  | { done: true }
+
+class AsyncPacketQueue {
+  private packets: QueuedRecordingPacket[] = []
+  private resolvers: ((packet: QueuedRecordingPacket) => void)[] = []
+
+  push(packet: QueuedRecordingPacket) {
+    const resolver = this.resolvers.shift()
+    if (resolver) {
+      resolver(packet)
+      return
+    }
+
+    this.packets.push(packet)
+  }
+
+  next() {
+    const packet = this.packets.shift()
+    if (packet) {
+      return Promise.resolve(packet)
+    }
+
+    return new Promise<QueuedRecordingPacket>((resolve) => {
+      this.resolvers.push(resolve)
+    })
+  }
+}
+
+class RingRecordingDelegate implements CameraRecordingDelegate {
+  public controller?: CameraController
+  private configuration?: CameraRecordingConfiguration
+  private active = false
+  private streams = new Map<number, { stop: () => void }>()
+  private readonly ringCamera: RingCamera
+
+  constructor(ringCamera: RingCamera) {
+    this.ringCamera = ringCamera
+  }
+
+  updateRecordingActive(active: boolean) {
+    this.active = active
+    logDebug(
+      `HomeKit Secure Video recording ${active ? 'enabled' : 'disabled'} for ${
+        this.ringCamera.name
+      }`,
+    )
+  }
+
+  updateRecordingConfiguration(
+    configuration: CameraRecordingConfiguration | undefined,
+  ) {
+    this.configuration = configuration
+  }
+
+  private get recordingAudioActive() {
+    return Boolean(
+      this.controller?.recordingManagement?.recordingManagementService.getCharacteristic(
+        hap.Characteristic.RecordingAudioActive,
+      ).value,
+    )
+  }
+
+  private getVideoArgs(configuration: CameraRecordingConfiguration) {
+    const [width, height, fps] = configuration.videoCodec.resolution,
+      { bitRate, iFrameInterval, level, profile } =
+        configuration.videoCodec.parameters,
+      profileName =
+        profile === H264Profile.HIGH
+          ? 'high'
+          : profile === H264Profile.MAIN
+          ? 'main'
+          : 'baseline',
+      levelName =
+        level === H264Level.LEVEL4_0
+          ? '4.0'
+          : level === H264Level.LEVEL3_2
+          ? '3.2'
+          : '3.1'
+
+    return [
+      '-codec:v',
+      'libx264',
+      '-pix_fmt',
+      'yuv420p',
+      '-profile:v',
+      profileName,
+      '-level:v',
+      levelName,
+      '-b:v',
+      `${bitRate}k`,
+      '-force_key_frames',
+      `expr:eq(t,n_forced*${iFrameInterval / 1000})`,
+      '-r',
+      fps.toString(),
+      '-s',
+      `${width}x${height}`,
+    ]
+  }
+
+  private getAudioArgs(configuration: CameraRecordingConfiguration) {
+    if (!this.recordingAudioActive) {
+      return ['-an']
+    }
+
+    const samplerate = [8, 16, 24, 32, 44.1, 48][
+      configuration.audioCodec.samplerate
+    ]
+
+    return [
+      '-acodec',
+      'aac',
+      '-profile:a',
+      configuration.audioCodec.type === 1 ? 'aac_eld' : 'aac_low',
+      '-ar',
+      `${samplerate}k`,
+      '-b:a',
+      `${configuration.audioCodec.bitrate}k`,
+      '-ac',
+      `${configuration.audioCodec.audioChannels || 1}`,
+    ]
+  }
+
+  private createPacketWriter(queue: AsyncPacketQueue) {
+    let buffer = Buffer.alloc(0),
+      pendingBoxes: Buffer[] = []
+
+    return (data: Buffer) => {
+      buffer = Buffer.concat([buffer, data])
+
+      while (buffer.length >= 8) {
+        const boxLength = buffer.readUInt32BE(0)
+        if (!boxLength || buffer.length < boxLength) {
+          return
+        }
+
+        const box = buffer.subarray(0, boxLength),
+          boxType = box.subarray(4, 8).toString()
+        buffer = buffer.subarray(boxLength)
+        pendingBoxes.push(box)
+
+        if (boxType === 'moov' || boxType === 'mdat') {
+          queue.push({
+            packet: {
+              data: Buffer.concat(pendingBoxes),
+              isLast: false,
+            },
+          })
+          pendingBoxes = []
+        }
+      }
+    }
+  }
+
+  async *handleRecordingStreamRequest(
+    streamId: number,
+    signal?: AbortSignal,
+  ): AsyncGenerator<RecordingPacket> {
+    if (!this.active) {
+      throw new Error('HomeKit Secure Video recording is not active')
+    }
+
+    const configuration = this.configuration
+    if (!configuration) {
+      throw new Error('HomeKit Secure Video recording is not configured')
+    }
+
+    const queue = new AsyncPacketQueue(),
+      liveCall = await this.ringCamera.startLiveCall(),
+      stop = () => {
+        liveCall.stop()
+        queue.push({ done: true })
+      },
+      abortHandler = () => stop()
+
+    this.streams.set(streamId, { stop })
+    signal?.addEventListener('abort', abortHandler, { once: true })
+    liveCall.onCallEnded.pipe(take(1)).subscribe(() => {
+      queue.push({
+        packet: {
+          data: Buffer.alloc(0),
+          isLast: true,
+        },
+      })
+    })
+
+    try {
+      await liveCall.startTranscoding({
+        audio: this.getAudioArgs(configuration),
+        video: this.getVideoArgs(configuration),
+        stdoutCallback: this.createPacketWriter(queue),
+        output: [
+          '-f',
+          'mp4',
+          '-fflags',
+          '+genpts',
+          '-reset_timestamps',
+          '1',
+          '-movflags',
+          'frag_keyframe+empty_moov+default_base_moof',
+          'pipe:1',
+        ],
+      })
+
+      while (!signal?.aborted) {
+        const queued = await queue.next()
+        if ('done' in queued) {
+          return
+        }
+        if ('error' in queued) {
+          throw queued.error
+        }
+
+        yield queued.packet
+
+        if (queued.packet.isLast) {
+          return
+        }
+      }
+    } finally {
+      signal?.removeEventListener('abort', abortHandler)
+      this.closeRecordingStream(streamId)
+    }
+  }
+
+  acknowledgeStream(streamId: number) {
+    this.closeRecordingStream(streamId)
+  }
+
+  closeRecordingStream(streamId: number) {
+    const stream = this.streams.get(streamId)
+    stream?.stop()
+    this.streams.delete(streamId)
+  }
+}
 
 const __dirname = new URL('.', import.meta.url).pathname,
   mediaDirectory = path.join(__dirname.replace(/\/lib\/?$/, ''), 'media'),
@@ -330,11 +574,69 @@ export class CameraSource implements CameraStreamingDelegate {
   private cachedSnapshot?: Buffer
   private ringCamera
 
-  constructor(ringCamera: RingCamera) {
+  constructor(ringCamera: RingCamera, config: RingPlatformConfig) {
     this.ringCamera = ringCamera
+    const recordingDelegate = config.enableHomeKitSecureVideo
+        ? new RingRecordingDelegate(ringCamera)
+        : undefined,
+      recordingOptions: CameraRecordingOptions = {
+        prebufferLength: 4000,
+        mediaContainerConfiguration: {
+          type: 0,
+          fragmentLength: 4000,
+        },
+        video: {
+          type: 0,
+          parameters: {
+            profiles: [
+              H264Profile.BASELINE,
+              H264Profile.MAIN,
+              H264Profile.HIGH,
+            ],
+            levels: [
+              H264Level.LEVEL3_1,
+              H264Level.LEVEL3_2,
+              H264Level.LEVEL4_0,
+            ],
+          },
+          resolutions: [
+            [1920, 1080, 30],
+            [1280, 720, 30],
+            [1024, 768, 30],
+            [640, 480, 30],
+            [640, 360, 30],
+            [480, 360, 30],
+            [320, 240, 30],
+          ],
+        },
+        audio: {
+          codecs: {
+            type: 0,
+            audioChannels: 1,
+            samplerate: [1, 2, 5],
+            bitrateMode: 0,
+          },
+        },
+        overrideEventTriggerOptions: [1, 2],
+      },
+      recording = recordingDelegate
+        ? {
+            options: recordingOptions,
+            delegate: recordingDelegate,
+          }
+        : undefined
+
     this.controller = new hap.CameraController({
-      cameraStreamCount: 10,
+      cameraStreamCount: recording ? 1 : 10,
       delegate: this,
+      ...(recording
+        ? {
+            recording,
+            sensors: {
+              motion: true,
+            },
+          }
+        : {}),
       streamingOptions: {
         supportedCryptoSuites: [SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80],
         video: {
@@ -374,6 +676,10 @@ export class CameraSource implements CameraStreamingDelegate {
         },
       },
     })
+
+    if (recordingDelegate) {
+      recordingDelegate.controller = this.controller
+    }
   }
 
   private previousLoadSnapshotPromise?: Promise<any>

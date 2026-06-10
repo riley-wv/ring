@@ -16,6 +16,11 @@
         "description": "Click \"Generate New Refresh Token\" above to change accounts or if your refresh token has expired",
         "placeholder": "Refresh Token"
       },
+      "enableHomeKitSecureVideo": {
+        "title": "Enable HomeKit Secure Video",
+        "type": "boolean",
+        "description": "Adds HomeKit Secure Video recording services and event-triggered recording support for cameras."
+      },
       "alarmOnEntryDelay": {
         "title": "Alarm on Entry Delay",
         "type": "boolean",
@@ -159,6 +164,7 @@
         "hideCameraMotionSensor",
         "hideCameraSirenSwitch",
         "hideInHomeDoorbellSwitch",
+        "enableHomeKitSecureVideo",
         "hideAlarmSirenSwitch",
         "showPanicButtons",
         "nightModeBypassFor",

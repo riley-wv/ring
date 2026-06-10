@@ -10,6 +10,7 @@ export const controlCenterDisplayName = 'homebridge-ring'
 export interface RingPlatformConfig extends RingApiOptions {
   alarmOnEntryDelay?: boolean
   beamDurationSeconds?: number
+  enableHomeKitSecureVideo?: boolean
   ffmpegPath?: string
   hideLightGroups?: boolean
   hideDoorbellSwitch?: boolean
